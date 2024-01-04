@@ -117,13 +117,11 @@ class ModelWorker:
             "speed": 1,
             "queue_length": self.get_queue_length(),
         }
-
-    @torch.inference_mode()
-    def generate_stream(self, params):
+    
+    def generate_params(self, params, streaming=False):
         tokenizer, model, image_processor = self.tokenizer, self.model, self.image_processor
 
         prompt = params["prompt"]
-        ori_prompt = prompt
         images = params.get("images", None)
         num_image_tokens = 0
         if images is not None and len(images) > 0 and self.is_multimodal:
@@ -156,21 +154,17 @@ class ModelWorker:
         top_p = float(params.get("top_p", 1.0))
         max_context_length = getattr(model.config, 'max_position_embeddings', 2048)
         max_new_tokens = min(int(params.get("max_new_tokens", 256)), 1024)
-        stop_str = params.get("stop", None)
+        stop_str_list = params.get("stop", None)
         do_sample = True if temperature > 0.001 else False
 
         input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
-        keywords = [stop_str]
+        keywords = stop_str_list
         stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
-        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=15)
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=15) if streaming else None
 
         max_new_tokens = min(max_new_tokens, max_context_length - input_ids.shape[-1] - num_image_tokens)
 
-        if max_new_tokens < 1:
-            yield json.dumps({"text": ori_prompt + "Exceeds max token length. Please start a new conversation, thanks.", "error_code": 0}).encode() + b"\0"
-            return
-
-        thread = Thread(target=model.generate, kwargs=dict(
+        generate_params = dict(
             inputs=input_ids,
             do_sample=do_sample,
             temperature=temperature,
@@ -180,11 +174,37 @@ class ModelWorker:
             stopping_criteria=[stopping_criteria],
             use_cache=True,
             **image_args
-        ))
+        )
+        return generate_params
+
+    @torch.inference_mode()
+    def generate(self, params):
+        tokenizer, model = self.tokenizer, self.model
+        generate_params = self.generate_params(params, streaming=False)
+        output_ids = model.generate(**generate_params)
+        output = tokenizer.decode(output_ids[0, generate_params['inputs'].shape[1]:]).strip()
+        stop_str_list = params['stop']
+        for stop_str in stop_str_list:
+            if output.endswith(stop_str):
+                    output = output[:-len(stop_str)]
+                    break
+        return output
+
+    @torch.inference_mode()
+    def generate_stream(self, params):
+        tokenizer, model = self.tokenizer, self.model
+        generate_params = self.generate_params(params, streaming=True)
+
+        if generate_params['max_new_tokens'] < 1:
+            yield json.dumps({"text": params['prompt'] + "Exceeds max token length. Please start a new conversation, thanks.", "error_code": 0}).encode() + b"\0"
+            return
+
+        thread = Thread(target=model.generate, kwargs=generate_params)
         thread.start()
 
-        generated_text = ori_prompt
-        for new_text in streamer:
+        stop_str = params['stop']
+        generated_text = params['prompt']
+        for new_text in generate_params['streamer']:
             generated_text += new_text
             if generated_text.endswith(stop_str):
                 generated_text = generated_text[:-len(stop_str)]
@@ -197,21 +217,21 @@ class ModelWorker:
         except ValueError as e:
             print("Caught ValueError:", e)
             ret = {
-                "text": server_error_msg,
+                "text": str(e),
                 "error_code": 1,
             }
             yield json.dumps(ret).encode() + b"\0"
         except torch.cuda.CudaError as e:
             print("Caught torch.cuda.CudaError:", e)
             ret = {
-                "text": server_error_msg,
+                "text": str(e),
                 "error_code": 1,
             }
             yield json.dumps(ret).encode() + b"\0"
         except Exception as e:
             print("Caught Unknown Error", e)
             ret = {
-                "text": server_error_msg,
+                "text": str(e),
                 "error_code": 1,
             }
             yield json.dumps(ret).encode() + b"\0"
@@ -219,12 +239,15 @@ class ModelWorker:
 
 app = FastAPI()
 
+@app.post("/worker_generate")
+async def generate(request: Request):
+    params = await request.json()
+    return worker.generate(params)
 
 def release_model_semaphore(fn=None):
     model_semaphore.release()
     if fn is not None:
         fn()
-
 
 @app.post("/worker_generate_stream")
 async def generate_stream(request: Request):

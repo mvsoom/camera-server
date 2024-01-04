@@ -88,7 +88,7 @@ def main(args):
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
-                images=image_tensor,
+                images=[image_tensor],
                 do_sample=True,
                 temperature=0.2,
                 max_new_tokens=1024,

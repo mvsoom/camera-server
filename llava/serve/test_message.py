@@ -3,7 +3,8 @@ import json
 
 import requests
 
-from llava.conversation import default_conversation
+from llava.conversation import conv_mpt
+default_conversation = conv_mpt
 
 
 def main():
@@ -26,6 +27,8 @@ def main():
         return
 
     conv = default_conversation.copy()
+    print(conv)
+
     conv.append_message(conv.roles[0], args.message)
     prompt = conv.get_prompt()
 
@@ -34,11 +37,14 @@ def main():
         "model": args.model_name,
         "prompt": prompt,
         "max_new_tokens": args.max_new_tokens,
-        "temperature": 0.7,
+        "temperature": 0.,
         "stop": conv.sep,
     }
+
+    print(pload)
+
     response = requests.post(worker_addr + "/worker_generate_stream", headers=headers,
-            json=pload, stream=True)
+            json=pload, stream=False)
 
     print(prompt.replace(conv.sep, "\n"), end="")
     for chunk in response.iter_lines(chunk_size=8192, decode_unicode=False, delimiter=b"\0"):
